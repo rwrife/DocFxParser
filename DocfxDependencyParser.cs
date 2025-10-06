@@ -1,4 +1,3 @@
-using System.Linq;
 using HtmlAgilityPack;
 using Markdig;
 using Markdig.Syntax;
@@ -6,13 +5,17 @@ using Markdig.Syntax.Inlines;
 using Microsoft.Extensions.FileSystemGlobbing;
 using Microsoft.Extensions.FileSystemGlobbing.Abstractions;
 using Newtonsoft.Json;
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
 
 namespace DocFxParser;
 
 public class DocfxDependencyParser
 {
-    private static readonly string[] MarkdownExtensions = new[] { ".md", ".markdown", ".mdown", ".mkd" };
+    private static readonly string[] MarkdownExtensions = new[] { ".md" };
     private static readonly string[] HtmlExtensions = new[] { ".html", ".htm" };
+    private static readonly string[] YamlExtensions = new[] { ".yaml", ".yml" };
+    private static readonly string[] TocFileNames = new[] { "toc.yml", "toc.yaml", "toc.md" };
 
     private readonly MarkdownPipeline _markdownPipeline;
 
@@ -67,7 +70,7 @@ public class DocfxDependencyParser
 
             foreach (var mapping in mappings)
             {
-                foreach (var match in ExpandMapping(mapping, configDirectory))
+                foreach (var match in ExpandMapping(mapping, configDirectory, config.Build?.Exclude))
                 {
                     RegisterFile(match, sourceType);
                 }
@@ -120,8 +123,13 @@ public class DocfxDependencyParser
             var fullPath = kvp.Key;
             var dependency = kvp.Value;
             var extension = Path.GetExtension(fullPath);
+            var fileName = Path.GetFileName(fullPath);
 
-            if (MarkdownExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase))
+            if (IsTocFile(fileName))
+            {
+                dependency.References = ExtractTocReferences(fullPath, configDirectory, knownFiles);
+            }
+            else if (MarkdownExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase))
             {
                 dependency.References = ExtractMarkdownReferences(fullPath, configDirectory, knownFiles);
             }
@@ -154,7 +162,7 @@ public class DocfxDependencyParser
         return config;
     }
 
-    private static IEnumerable<string> ExpandMapping(FileMappingItem mapping, string configDirectory)
+    private static IEnumerable<string> ExpandMapping(FileMappingItem mapping, string configDirectory, List<string>? globalExclude = null)
     {
         var includes = mapping.Files ?? new List<string>();
         if (includes.Count == 0)
@@ -178,6 +186,16 @@ public class DocfxDependencyParser
             matcher.AddInclude(include);
         }
 
+        // Apply global exclude rules first
+        if (globalExclude != null)
+        {
+            foreach (var exclude in globalExclude)
+            {
+                matcher.AddExclude(exclude);
+            }
+        }
+
+        // Apply mapping-specific exclude rules
         if (mapping.Exclude != null)
         {
             foreach (var exclude in mapping.Exclude)
@@ -319,6 +337,149 @@ public class DocfxDependencyParser
             .ToList();
     }
 
+    private static bool IsTocFile(string fileName)
+    {
+        return TocFileNames.Contains(fileName, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private List<string> ExtractTocReferences(string tocPath, string docsetRoot, IDictionary<string, FileDependency> knownFiles)
+    {
+        var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var baseDirectory = Path.GetDirectoryName(tocPath)!;
+        var fileName = Path.GetFileName(tocPath);
+
+        if (fileName.Equals("toc.md", StringComparison.OrdinalIgnoreCase))
+        {
+            // Parse markdown TOC
+            var content = File.ReadAllText(tocPath);
+            var document = Markdig.Markdown.Parse(content, _markdownPipeline);
+
+            foreach (var link in document.Descendants<LinkInline>())
+            {
+                if (string.IsNullOrEmpty(link.Url))
+                {
+                    continue;
+                }
+
+                ProcessTocReference(link.Url, baseDirectory, docsetRoot, knownFiles, references);
+            }
+        }
+        else if (fileName.Equals("toc.yml", StringComparison.OrdinalIgnoreCase) || 
+                 fileName.Equals("toc.yaml", StringComparison.OrdinalIgnoreCase))
+        {
+            // Parse YAML TOC
+            try
+            {
+                var yaml = File.ReadAllText(tocPath);
+                var deserializer = new DeserializerBuilder()
+                    .WithNamingConvention(CamelCaseNamingConvention.Instance)
+                    .IgnoreUnmatchedProperties()
+                    .Build();
+
+                var tocItems = deserializer.Deserialize<List<TocItem>>(yaml);
+                if (tocItems != null)
+                {
+                    ProcessTocItems(tocItems, baseDirectory, docsetRoot, knownFiles, references);
+                }
+            }
+            catch (Exception)
+            {
+                // If YAML parsing fails, skip this file
+            }
+        }
+
+        return references
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(r => r, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private void ProcessTocItems(List<TocItem> items, string baseDirectory, string docsetRoot, IDictionary<string, FileDependency> knownFiles, HashSet<string> references)
+    {
+        foreach (var item in items)
+        {
+            // Process href (can be a file or another toc)
+            if (!string.IsNullOrEmpty(item.Href))
+            {
+                ProcessTocReference(item.Href, baseDirectory, docsetRoot, knownFiles, references);
+            }
+
+            // Process topicHref (the landing page for a folder with a toc)
+            if (!string.IsNullOrEmpty(item.TopicHref))
+            {
+                ProcessTocReference(item.TopicHref, baseDirectory, docsetRoot, knownFiles, references);
+            }
+
+            // Process homepage
+            if (!string.IsNullOrEmpty(item.Homepage))
+            {
+                ProcessTocReference(item.Homepage, baseDirectory, docsetRoot, knownFiles, references);
+            }
+
+            // Recursively process child items
+            if (item.Items != null && item.Items.Count > 0)
+            {
+                ProcessTocItems(item.Items, baseDirectory, docsetRoot, knownFiles, references);
+            }
+        }
+    }
+
+    private void ProcessTocReference(string href, string baseDirectory, string docsetRoot, IDictionary<string, FileDependency> knownFiles, HashSet<string> references)
+    {
+        var sanitized = SanitizeUrl(href);
+        if (string.IsNullOrEmpty(sanitized))
+        {
+            return;
+        }
+
+        // First, try to resolve as a direct file reference
+        foreach (var resolved in ResolveLinkTargets(sanitized, baseDirectory, docsetRoot, knownFiles))
+        {
+            references.Add(resolved);
+        }
+
+        // If the href is a directory reference, look for toc files in that directory
+        var candidatePaths = new List<string>();
+        
+        if (sanitized.StartsWith("~/", StringComparison.Ordinal))
+        {
+            var relative = sanitized.Substring(2).TrimEnd('/');
+            candidatePaths.Add(Path.GetFullPath(Path.Combine(docsetRoot, NormalizeForPath(relative))));
+        }
+        else if (sanitized.StartsWith("/", StringComparison.Ordinal))
+        {
+            var relative = sanitized.TrimStart('/').TrimEnd('/');
+            candidatePaths.Add(Path.GetFullPath(Path.Combine(docsetRoot, NormalizeForPath(relative))));
+        }
+        else if (Path.IsPathRooted(sanitized))
+        {
+            candidatePaths.Add(Path.GetFullPath(NormalizeForPath(sanitized)));
+        }
+        else
+        {
+            var relative = NormalizeForPath(sanitized).TrimEnd(Path.DirectorySeparatorChar);
+            candidatePaths.Add(Path.GetFullPath(Path.Combine(baseDirectory, relative)));
+        }
+
+        // Check if any candidate is a directory and look for TOC files
+        foreach (var candidatePath in candidatePaths)
+        {
+            if (Directory.Exists(candidatePath))
+            {
+                foreach (var tocFileName in TocFileNames)
+                {
+                    var tocPath = Path.Combine(candidatePath, tocFileName);
+                    var normalized = NormalizeFullPath(tocPath);
+                    
+                    if (knownFiles.TryGetValue(normalized, out var dependency))
+                    {
+                        references.Add(dependency.Path);
+                    }
+                }
+            }
+        }
+    }
+
     private IEnumerable<string> ResolveLinkTargets(string url, string baseDirectory, string docsetRoot, IDictionary<string, FileDependency> knownFiles)
     {
         var sanitized = SanitizeUrl(url);
@@ -392,6 +553,12 @@ public class DocfxDependencyParser
 
     private static string DetermineFileType(string path)
     {
+        var fileName = Path.GetFileName(path);
+        if (IsTocFile(fileName))
+        {
+            return "toc";
+        }
+
         var extension = Path.GetExtension(path);
         if (MarkdownExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase))
         {
@@ -403,7 +570,7 @@ public class DocfxDependencyParser
             return "html";
         }
 
-        if (extension.Equals(".yml", StringComparison.OrdinalIgnoreCase) || extension.Equals(".yaml", StringComparison.OrdinalIgnoreCase))
+        if (YamlExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase))
         {
             return "yaml";
         }

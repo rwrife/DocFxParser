@@ -3,11 +3,19 @@ using Newtonsoft.Json;
 
 if (args.Length == 0)
 {
-    Console.Error.WriteLine("Usage: DocFxParser <path-to-docfx.json>");
+    Console.Error.WriteLine("Usage: DocFxParser <path-to-docfx.json-or-directory>");
     return 1;
 }
 
-var docfxConfigPath = Path.GetFullPath(args[0]);
+var inputPath = Path.GetFullPath(args[0]);
+var docfxConfigPath = inputPath;
+
+// If the path is a directory, append docfx.json
+if (Directory.Exists(inputPath))
+{
+    docfxConfigPath = Path.Combine(inputPath, "docfx.json");
+}
+
 if (!File.Exists(docfxConfigPath))
 {
     Console.Error.WriteLine($"docfx.json not found at '{docfxConfigPath}'");

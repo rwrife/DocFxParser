@@ -19,6 +19,10 @@ public class DocfxBuildConfig
     [JsonProperty("overwrite")]
     public List<FileMappingItem>? Overwrite { get; set; }
 
+    [JsonProperty("exclude")]
+    [JsonConverter(typeof(FlexibleStringListConverter))]
+    public List<string>? Exclude { get; set; }
+
     [JsonProperty("globalMetadataFiles")]
     [JsonConverter(typeof(FlexibleStringListConverter))]
     public List<string>? GlobalMetadataFiles { get; set; }
@@ -65,4 +69,22 @@ public class FileDependency
 
     [JsonProperty("references")]
     public List<string> References { get; set; } = new();
+}
+
+public class TocItem
+{
+    [JsonProperty("name")]
+    public string? Name { get; set; }
+
+    [JsonProperty("href")]
+    public string? Href { get; set; }
+
+    [JsonProperty("topicHref")]
+    public string? TopicHref { get; set; }
+
+    [JsonProperty("homepage")]
+    public string? Homepage { get; set; }
+
+    [JsonProperty("items")]
+    public List<TocItem>? Items { get; set; }
 }

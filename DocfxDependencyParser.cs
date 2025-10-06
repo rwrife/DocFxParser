@@ -286,7 +286,11 @@ public class DocfxDependencyParser
         var matcher = new Matcher(StringComparison.OrdinalIgnoreCase);
         foreach (var include in includes)
         {
-            matcher.AddInclude(include);
+            // Expand brace patterns like **/*.{md,yml} into separate patterns
+            foreach (var expanded in ExpandBracePattern(include))
+            {
+                matcher.AddInclude(expanded);
+            }
         }
 
         // Apply global exclude rules first
@@ -372,6 +376,36 @@ public class DocfxDependencyParser
     private static bool ContainsGlobCharacters(string value)
     {
         return value.IndexOfAny(new[] { '*', '?', '[', ']' }) >= 0;
+    }
+
+    /// <summary>
+    /// Expands brace patterns like **/*.{md,yml} into separate patterns: **/*.md, **/*.yml
+    /// </summary>
+    private static IEnumerable<string> ExpandBracePattern(string pattern)
+    {
+        var openBrace = pattern.IndexOf('{');
+        var closeBrace = pattern.IndexOf('}');
+
+        // No brace pattern, return as-is
+        if (openBrace == -1 || closeBrace == -1 || closeBrace <= openBrace)
+        {
+            yield return pattern;
+            yield break;
+        }
+
+        var prefix = pattern.Substring(0, openBrace);
+        var suffix = pattern.Substring(closeBrace + 1);
+        var options = pattern.Substring(openBrace + 1, closeBrace - openBrace - 1);
+
+        foreach (var option in options.Split(','))
+        {
+            var expanded = prefix + option.Trim() + suffix;
+            // Recursively expand in case there are nested braces
+            foreach (var result in ExpandBracePattern(expanded))
+            {
+                yield return result;
+            }
+        }
     }
 
     private List<string> ExtractMarkdownReferences(string markdownPath, string docsetRoot, IDictionary<string, FileDependency> knownFiles)

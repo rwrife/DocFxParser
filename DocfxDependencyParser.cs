@@ -10,6 +10,46 @@ using YamlDotNet.Serialization.NamingConventions;
 
 namespace DocFxParser;
 
+/// <summary>
+/// Callback interface for file access operations.
+/// Implement this to control how the parser accesses files.
+/// </summary>
+public interface IFileAccessCallback
+{
+    /// <summary>
+    /// Called before a file is read. Return true to allow reading, false to skip.
+    /// </summary>
+    /// <param name="filePath">The full path to the file that will be read</param>
+    /// <param name="purpose">The purpose of the file read (e.g., "config", "content", "toc", "markdown", etc.)</param>
+    /// <returns>True to allow the file to be read, false to skip it</returns>
+    bool OnBeforeFileRead(string filePath, string purpose);
+
+    /// <summary>
+    /// Called after a file has been successfully read.
+    /// </summary>
+    /// <param name="filePath">The full path to the file that was read</param>
+    /// <param name="purpose">The purpose of the file read</param>
+    void OnAfterFileRead(string filePath, string purpose);
+
+    /// <summary>
+    /// Called when a file read fails.
+    /// </summary>
+    /// <param name="filePath">The full path to the file that failed to read</param>
+    /// <param name="purpose">The purpose of the file read</param>
+    /// <param name="exception">The exception that occurred</param>
+    void OnFileReadError(string filePath, string purpose, Exception exception);
+}
+
+/// <summary>
+/// Default implementation that allows all file operations.
+/// </summary>
+public class DefaultFileAccessCallback : IFileAccessCallback
+{
+    public bool OnBeforeFileRead(string filePath, string purpose) => true;
+    public void OnAfterFileRead(string filePath, string purpose) { }
+    public void OnFileReadError(string filePath, string purpose, Exception exception) { }
+}
+
 public class DocfxDependencyParser
 {
     private static readonly string[] MarkdownExtensions = new[] { ".md" };
@@ -18,10 +58,16 @@ public class DocfxDependencyParser
     private static readonly string[] TocFileNames = new[] { "toc.yml", "toc.yaml", "toc.md" };
 
     private readonly MarkdownPipeline _markdownPipeline;
+    private readonly IFileAccessCallback _fileAccessCallback;
 
-    public DocfxDependencyParser()
+    public DocfxDependencyParser() : this(new DefaultFileAccessCallback())
+    {
+    }
+
+    public DocfxDependencyParser(IFileAccessCallback fileAccessCallback)
     {
         _markdownPipeline = new MarkdownPipelineBuilder().UseAdvancedExtensions().Build();
+        _fileAccessCallback = fileAccessCallback ?? throw new ArgumentNullException(nameof(fileAccessCallback));
     }
 
     public DocfxDependencyResult Collect(string docfxConfigPath)
@@ -101,7 +147,7 @@ public class DocfxDependencyParser
 
                 foreach (var candidate in ExpandAdditionalEntry(entry, configDirectory))
                 {
-                    if (File.Exists(candidate))
+                    if (FileExistsWithCallback(candidate, sourceType))
                     {
                         RegisterFile(candidate, sourceType);
                     }
@@ -109,7 +155,10 @@ public class DocfxDependencyParser
                     {
                         foreach (var file in Directory.EnumerateFiles(candidate, "*", SearchOption.AllDirectories))
                         {
-                            RegisterFile(file, sourceType);
+                            if (_fileAccessCallback.OnBeforeFileRead(file, sourceType))
+                            {
+                                RegisterFile(file, sourceType);
+                            }
                         }
                     }
                 }
@@ -135,7 +184,11 @@ public class DocfxDependencyParser
             }
             else if (HtmlExtensions.Contains(extension, StringComparer.OrdinalIgnoreCase))
             {
-                dependency.References = ExtractHtmlReferences(File.ReadAllText(fullPath), Path.GetDirectoryName(fullPath)!, configDirectory, knownFiles);
+                var htmlContent = ReadFileWithCallback(fullPath, "html");
+                if (htmlContent != null)
+                {
+                    dependency.References = ExtractHtmlReferences(htmlContent, Path.GetDirectoryName(fullPath)!, configDirectory, knownFiles);
+                }
             }
         }
 
@@ -147,19 +200,69 @@ public class DocfxDependencyParser
         };
     }
 
-    private static DocfxConfig LoadConfiguration(string configPath)
+    /// <summary>
+    /// Safely read a file with callback notification.
+    /// </summary>
+    private string? ReadFileWithCallback(string filePath, string purpose)
     {
-        using var stream = File.OpenRead(configPath);
-        using var reader = new StreamReader(stream);
-        using var jsonReader = new JsonTextReader(reader);
-        var serializer = new JsonSerializer();
-        var config = serializer.Deserialize<DocfxConfig>(jsonReader);
-        if (config == null)
+        if (!_fileAccessCallback.OnBeforeFileRead(filePath, purpose))
         {
-            throw new InvalidOperationException("The docfx.json file could not be deserialized.");
+            return null;
         }
 
-        return config;
+        try
+        {
+            var content = File.ReadAllText(filePath);
+            _fileAccessCallback.OnAfterFileRead(filePath, purpose);
+            return content;
+        }
+        catch (Exception ex)
+        {
+            _fileAccessCallback.OnFileReadError(filePath, purpose, ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Check if a file exists and notify callback before accessing.
+    /// </summary>
+    private bool FileExistsWithCallback(string filePath, string purpose)
+    {
+        if (!_fileAccessCallback.OnBeforeFileRead(filePath, purpose))
+        {
+            return false;
+        }
+
+        return File.Exists(filePath);
+    }
+
+    private DocfxConfig LoadConfiguration(string configPath)
+    {
+        if (!_fileAccessCallback.OnBeforeFileRead(configPath, "config"))
+        {
+            throw new InvalidOperationException($"File access denied by callback: {configPath}");
+        }
+
+        try
+        {
+            using var stream = File.OpenRead(configPath);
+            using var reader = new StreamReader(stream);
+            using var jsonReader = new JsonTextReader(reader);
+            var serializer = new JsonSerializer();
+            var config = serializer.Deserialize<DocfxConfig>(jsonReader);
+            if (config == null)
+            {
+                throw new InvalidOperationException("The docfx.json file could not be deserialized.");
+            }
+
+            _fileAccessCallback.OnAfterFileRead(configPath, "config");
+            return config;
+        }
+        catch (Exception ex)
+        {
+            _fileAccessCallback.OnFileReadError(configPath, "config", ex);
+            throw;
+        }
     }
 
     private static IEnumerable<string> ExpandMapping(FileMappingItem mapping, string configDirectory, List<string>? globalExclude = null)
@@ -273,7 +376,12 @@ public class DocfxDependencyParser
 
     private List<string> ExtractMarkdownReferences(string markdownPath, string docsetRoot, IDictionary<string, FileDependency> knownFiles)
     {
-        var content = File.ReadAllText(markdownPath);
+        var content = ReadFileWithCallback(markdownPath, "markdown");
+        if (content == null)
+        {
+            return new List<string>();
+        }
+
         var document = Markdig.Markdown.Parse(content, _markdownPipeline);
         var references = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var baseDirectory = Path.GetDirectoryName(markdownPath)!;
@@ -351,17 +459,20 @@ public class DocfxDependencyParser
         if (fileName.Equals("toc.md", StringComparison.OrdinalIgnoreCase))
         {
             // Parse markdown TOC
-            var content = File.ReadAllText(tocPath);
-            var document = Markdig.Markdown.Parse(content, _markdownPipeline);
-
-            foreach (var link in document.Descendants<LinkInline>())
+            var content = ReadFileWithCallback(tocPath, "toc");
+            if (content != null)
             {
-                if (string.IsNullOrEmpty(link.Url))
-                {
-                    continue;
-                }
+                var document = Markdig.Markdown.Parse(content, _markdownPipeline);
 
-                ProcessTocReference(link.Url, baseDirectory, docsetRoot, knownFiles, references);
+                foreach (var link in document.Descendants<LinkInline>())
+                {
+                    if (string.IsNullOrEmpty(link.Url))
+                    {
+                        continue;
+                    }
+
+                    ProcessTocReference(link.Url, baseDirectory, docsetRoot, knownFiles, references);
+                }
             }
         }
         else if (fileName.Equals("toc.yml", StringComparison.OrdinalIgnoreCase) || 
@@ -370,16 +481,19 @@ public class DocfxDependencyParser
             // Parse YAML TOC
             try
             {
-                var yaml = File.ReadAllText(tocPath);
-                var deserializer = new DeserializerBuilder()
-                    .WithNamingConvention(CamelCaseNamingConvention.Instance)
-                    .IgnoreUnmatchedProperties()
-                    .Build();
-
-                var tocItems = deserializer.Deserialize<List<TocItem>>(yaml);
-                if (tocItems != null)
+                var yaml = ReadFileWithCallback(tocPath, "toc");
+                if (yaml != null)
                 {
-                    ProcessTocItems(tocItems, baseDirectory, docsetRoot, knownFiles, references);
+                    var deserializer = new DeserializerBuilder()
+                        .WithNamingConvention(CamelCaseNamingConvention.Instance)
+                        .IgnoreUnmatchedProperties()
+                        .Build();
+
+                    var tocItems = deserializer.Deserialize<List<TocItem>>(yaml);
+                    if (tocItems != null)
+                    {
+                        ProcessTocItems(tocItems, baseDirectory, docsetRoot, knownFiles, references);
+                    }
                 }
             }
             catch (Exception)
